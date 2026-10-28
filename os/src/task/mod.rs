@@ -20,6 +20,7 @@ use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
+use crate::mm::{MapPermission, VirtAddr,VPNRange};
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
@@ -153,6 +154,44 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+    ///用来增加的函数
+    fn record_syscall(&self, id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+
+        inner.tasks[current].syscall_times[id] += 1;
+    }
+    ///得到计数
+    fn get_syscall_times(&self, id: usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+
+        inner.tasks[current].syscall_times[id] as usize
+    }
+    ///我们用来改变每个任务内部的memory_set的函数，其实就是和地址空间交互
+    pub fn mmap(&self,start: VirtAddr,end: VirtAddr,permission:MapPermission) -> bool{
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        //memory_set 就是当前进程自己的整套虚拟内存空间管理对象
+        let memory_set = &mut inner.tasks[current].memory_set;
+
+        for vpn in VPNRange::new(start.floor(),end.ceil()){
+            if let Some(pte)= memory_set.translate(vpn){
+                if pte.is_valid(){
+                    return false;
+                }
+            }
+        }
+        memory_set.insert_framed_area(start,end,permission);
+        true
+    }
+    ///用来释放的函数，我们要做的就是把 [start, start + len) 覆盖到的每个虚拟页，从当前进程页表里删掉映射
+    pub fn munmap(&self,start:VirtAddr,end: VirtAddr) -> bool{
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let memory_set = &mut inner.tasks[current].memory_set;
+        memory_set.munmap(start,end)
+    }
 }
 
 /// Run the first task in task list.
@@ -201,4 +240,20 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+///接口
+pub fn record_syscall(id: usize) {
+    TASK_MANAGER.record_syscall(id);
+}
+///接口
+pub fn get_current_syscall_times(id: usize) -> usize {
+    TASK_MANAGER.get_syscall_times(id)
+}
+///接口
+pub fn mmap_current(start:VirtAddr,end:VirtAddr,permission:MapPermission) -> bool{
+    TASK_MANAGER.mmap(start,end,permission)
+}
+///接口
+pub fn munmap_current(start:VirtAddr,end:VirtAddr) -> bool{
+    TASK_MANAGER.munmap(start,end)
 }

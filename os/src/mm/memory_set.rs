@@ -262,6 +262,28 @@ impl MemorySet {
             false
         }
     }
+    ///用来解除映射，我们为地址空间实现这个方法
+    pub fn munmap(&mut self,start:VirtAddr,end:VirtAddr) -> bool{
+        let start_vpn = start.floor();
+        let end_vpn = end.ceil();
+        //1.先检查
+        for vpn in VPNRange::new(start_vpn,end_vpn){
+            match self.translate(vpn){
+                Some(pte) if pte.is_valid() => {}
+                _ => return false,
+            }
+        }
+        //2.再解除映射
+        for vpn in VPNRange::new(start_vpn,end_vpn){
+            for area in self.areas.iter_mut(){
+                if vpn >= area.vpn_range.get_start() && vpn < area.vpn_range.get_end(){
+                    area.unmap_one(&mut self.page_table,vpn);
+                    break;
+                }
+            }
+        }
+        true
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
