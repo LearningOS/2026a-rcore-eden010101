@@ -2,6 +2,9 @@
 //!
 use alloc::sync::Arc;
 
+use crate::config::BIG_STRIDE;
+use crate::mm::{translated_byte_buffer, MapPermission, StepByOne, VirtAddr};
+use crate::timer::get_time_us;
 use crate::{
     fs::{open_file, OpenFlags},
     mm::{translated_refmut, translated_str},
@@ -106,29 +109,88 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+    let ms = get_time_us();
+    let new_ms = TimeVal {
+        sec: ms / 1_000_000,
+        usec: ms % 1_000_000,
+    };
+    let buffers = translated_byte_buffer(
+        current_user_token(),
+        _ts as *const u8,
+        core::mem::size_of::<TimeVal>(),
     );
-    -1
+    let src = unsafe {
+        core::slice::from_raw_parts(
+            &new_ms as *const _ as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    let mut off = 0;
+    for buffer in buffers {
+        let n = buffer.len();
+        buffer.copy_from_slice(&src[off..off + n]);
+        off += n;
+    }
+    0
 }
 
 /// YOUR JOB: Implement mmap.
 pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    let current_task = current_task().unwrap();
+    let mut inner = current_task.inner_exclusive_access();
+    let _start_va = VirtAddr::from(_start);
+    let _end_va = VirtAddr::from(_start + _len);
+    if !_start_va.aligned() {
+        return -1;
+    }
+    let mut vpn = _start_va.floor();
+    let end_vpn = _end_va.ceil();
+    let mut perm = MapPermission::U;
+    if _port & 1 != 0 {
+        perm |= MapPermission::R;
+    }
+    if _port & 2 != 0 {
+        perm |= MapPermission::W;
+    }
+    if _port & 4 != 0 {
+        perm |= MapPermission::X;
+    }
+    if _port & !0x7 != 0 {
+        return -1;
+    }
+    if _port & 0x7 == 0 {
+        return -1;
+    }
+    while vpn < end_vpn {
+        let entry = inner.memory_set.translate(vpn);
+        match entry {
+            Some(entry) => {
+                if entry.is_valid() {
+                    return -1;
+                }
+            }
+            None => {}
+        }
+        vpn.step();
+    }
+    inner
+        .memory_set
+        .insert_framed_area(_start_va, _end_va, perm);
+    0
 }
 
 /// YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    let current_task = current_task().unwrap();
+    let mut inner = current_task.inner_exclusive_access();
+    let _start_vpn = VirtAddr::from(_start);
+    let _end_vpn = VirtAddr::from(_start + _len);
+    let start_vpn = _start_vpn.floor();
+    if !_start_vpn.aligned() || !_end_vpn.aligned() {
+        return -1;
+    }
+    inner.memory_set.remove_area_with_start_vpn(start_vpn);
+    0
 }
 
 /// change data segment size
@@ -144,18 +206,27 @@ pub fn sys_sbrk(size: i32) -> isize {
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
 pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, _path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = app_inode.read_all();
+        let task = current_task().unwrap();
+        let new_task = task.spawn(all_data.as_slice());
+        add_task(new_task.clone());
+        new_task.pid.0 as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
 pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    if _prio <= 1 {
+        return -1;
+    }
+    let current_task = current_task().unwrap();
+    let mut inner = current_task.inner_exclusive_access();
+    inner.prio = _prio;
+    inner.pass = BIG_STRIDE / (_prio as usize);
+    _prio
 }

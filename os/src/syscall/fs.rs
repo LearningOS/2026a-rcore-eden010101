@@ -1,8 +1,8 @@
 //! File and filesystem-related syscalls
-use crate::fs::{open_file, OpenFlags, Stat};
-use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
+use crate::fs::{open_file, OpenFlags, Stat,ROOT_INODE,StatMode};
+use crate::mm::{translated_byte_buffer, translated_str, UserBuffer,translated_refmut};
 use crate::task::{current_task, current_user_token};
-
+use alloc::sync::Arc;
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
     trace!("kernel:pid[{}] sys_write", current_task().unwrap().pid.0);
     let token = current_user_token();
@@ -77,27 +77,44 @@ pub fn sys_close(fd: usize) -> isize {
 
 /// YOUR JOB: Implement fstat.
 pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    if _fd >= inner.fd_table.len(){
+        return -1;
+    }
+    let file = match &inner.fd_table[_fd]{
+        Some(f) => Arc::clone(f),
+        None => return -1,
+    };
+    drop(inner);
+    let inode_id = file.inode_id();
+    let mode = StatMode::FILE;
+    let link_count = ROOT_INODE.count_nlink(file.inode_id());
+    let st = translated_refmut(current_user_token(), _st);
+    *st = Stat {
+        dev: 0,
+        ino: inode_id as u64,
+        mode,
+        nlink: link_count,
+        pad: [0; 7],
+    };
+    0
 }
 
 /// YOUR JOB: Implement linkat.
 pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    if _old_name == _new_name {
+        return -1;
+    }
+    let token = current_user_token();
+    let _old_name = translated_str(token, _old_name);
+    let _new_name = translated_str(token, _new_name);
+    ROOT_INODE.in_sys_linkat(&_old_name,&_new_name)
 }
 
 /// YOUR JOB: Implement unlinkat.
 pub fn sys_unlinkat(_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+    let token = current_user_token();
+    let name = translated_str(token,_name);
+    ROOT_INODE.in_sys_unlinkat(&name)
 }

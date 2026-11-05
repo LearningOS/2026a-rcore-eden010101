@@ -1,5 +1,6 @@
 //!Implementation of [`TaskManager`]
 use super::TaskControlBlock;
+use super::TaskStatus;
 use crate::sync::UPSafeCell;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -25,6 +26,25 @@ impl TaskManager {
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
         self.ready_queue.pop_front()
     }
+    /// fetch ready task with minimal stride
+    pub fn fetch_min_task(&mut self) -> Option<Arc<TaskControlBlock>> {
+        if self.ready_queue.is_empty() {
+            return None;
+        }
+        let mut min_i = 0;
+        let mut min_stride = usize::MAX;
+        for (i, task) in self.ready_queue.iter().enumerate() {
+            let inner = task.inner_exclusive_access();
+            if inner.task_status != TaskStatus::Ready {
+                continue;
+            }
+            if inner.stride < min_stride {
+                min_stride = inner.stride;
+                min_i = i;
+            }
+        }
+        self.ready_queue.remove(min_i)
+    }
 }
 
 lazy_static! {
@@ -43,4 +63,9 @@ pub fn add_task(task: Arc<TaskControlBlock>) {
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
     //trace!("kernel: TaskManager::fetch_task");
     TASK_MANAGER.exclusive_access().fetch()
+}
+
+/// Take the minimal-stride ready task
+pub fn fetch_min_task() -> Option<Arc<TaskControlBlock>> {
+    TASK_MANAGER.exclusive_access().fetch_min_task()
 }

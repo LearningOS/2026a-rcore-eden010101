@@ -71,6 +71,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+    /// process priority for stride scheduling
+    pub prio: isize,
+    /// current stride
+    pub stride: usize,
+    /// stride pass
+    pub pass: usize,
 }
 
 impl TaskControlBlockInner {
@@ -135,6 +141,9 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    prio: 16,
+                    stride: 0,
+                    pass: 4,
                 })
             },
         };
@@ -216,6 +225,9 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    prio: parent_inner.prio,
+                    stride: parent_inner.stride,
+                    pass: parent_inner.pass,
                 })
             },
         });
@@ -229,6 +241,57 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+
+    /// spawn a new process from elf, with parent linkage (not fork+exec)
+    pub fn spawn(self: &Arc<TaskControlBlock>, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let mut parent_inner = self.inner_exclusive_access();
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    fd_table: vec![
+                        Some(Arc::new(Stdin)),
+                        Some(Arc::new(Stdout)),
+                        Some(Arc::new(Stdout)),
+                    ],
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    prio: 16,
+                    stride: 0,
+                    pass: 4,
+                })
+            },
+        });
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        parent_inner.children.push(task_control_block.clone());
+        trap_cx.kernel_sp = kernel_stack_top;
+        task_control_block
     }
 
     /// get pid of process
@@ -260,6 +323,12 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// accumulate stride when scheduled
+    pub fn add_stride(&self) {
+        let mut inner = self.inner_exclusive_access();
+        inner.stride += inner.pass;
     }
 }
 

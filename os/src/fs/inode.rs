@@ -26,15 +26,16 @@ pub struct OSInode {
 pub struct OSInodeInner {
     offset: usize,
     inode: Arc<Inode>,
+    id :u32,
 }
 
 impl OSInode {
     /// create a new inode in memory
-    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>) -> Self {
+    pub fn new(readable: bool, writable: bool, inode: Arc<Inode>,id: u32) -> Self {
         Self {
             readable,
             writable,
-            inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
+            inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode ,id}) },
         }
     }
     /// read all data from the inode
@@ -56,6 +57,7 @@ impl OSInode {
 }
 
 lazy_static! {
+    ///....
     pub static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
@@ -108,19 +110,19 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
         if let Some(inode) = ROOT_INODE.find(name) {
             // clear size
             inode.clear();
-            Some(Arc::new(OSInode::new(readable, writable, inode)))
+            Some(Arc::new(OSInode::new(readable, writable, inode,ROOT_INODE.pub_get_inode_id(name).unwrap())))
         } else {
             // create file
             ROOT_INODE
                 .create(name)
-                .map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
+                .map(|inode| Arc::new(OSInode::new(readable, writable, inode,ROOT_INODE.pub_get_inode_id(name).unwrap())))
         }
     } else {
         ROOT_INODE.find(name).map(|inode| {
             if flags.contains(OpenFlags::TRUNC) {
                 inode.clear();
             }
-            Arc::new(OSInode::new(readable, writable, inode))
+            Arc::new(OSInode::new(readable, writable, inode,ROOT_INODE.pub_get_inode_id(name).unwrap()))
         })
     }
 }
@@ -155,5 +157,9 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn inode_id(&self) -> u32{
+        let inner = self.inner.exclusive_access();
+        inner.id
     }
 }
