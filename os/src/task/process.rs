@@ -23,6 +23,139 @@ pub struct ProcessControlBlock {
     inner: UPSafeCell<ProcessControlBlockInner>,
 }
 
+/// Deadlock detection state for a resource category (Mutex or Semaphore)
+#[derive(Default, Clone)]
+pub struct DeadlockDetector {
+    /// Available units for each resource id
+    pub available: Vec<usize>,
+    /// Allocated units per thread [tid][res_id]
+    pub allocation: Vec<Vec<usize>>,
+    /// Needed units per thread [tid][res_id]
+    pub need: Vec<Vec<usize>>,
+}
+
+impl DeadlockDetector {
+    /// Create an empty DeadlockDetector
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ensure matrices are large enough for `num_tasks` threads and `num_res` resources
+    pub fn ensure_size(&mut self, num_tasks: usize, num_res: usize) {
+        if self.available.len() < num_res {
+            self.available.resize(num_res, 0);
+        }
+        if self.allocation.len() < num_tasks {
+            self.allocation.resize(num_tasks, Vec::new());
+        }
+        if self.need.len() < num_tasks {
+            self.need.resize(num_tasks, Vec::new());
+        }
+        let target_res = self.available.len();
+        for row in self.allocation.iter_mut() {
+            if row.len() < target_res {
+                row.resize(target_res, 0);
+            }
+        }
+        for row in self.need.iter_mut() {
+            if row.len() < target_res {
+                row.resize(target_res, 0);
+            }
+        }
+    }
+
+    /// Register or reset a resource `res_id` with initial `count`
+    pub fn add_resource(&mut self, res_id: usize, count: usize, num_tasks: usize) {
+        self.ensure_size(num_tasks, res_id + 1);
+        self.available[res_id] = count;
+        for row in self.allocation.iter_mut() {
+            row[res_id] = 0;
+        }
+        for row in self.need.iter_mut() {
+            row[res_id] = 0;
+        }
+    }
+
+    /// Run safety algorithm to check if the current state is deadlock-free
+    pub fn is_safe(&self) -> bool {
+        let num_tasks = self.allocation.len();
+        let num_res = self.available.len();
+        let mut work = self.available.clone();
+        let mut finish = vec![false; num_tasks];
+
+        loop {
+            let mut found = false;
+            for i in 0..num_tasks {
+                if !finish[i] && (0..num_res).all(|j| self.need[i][j] <= work[j]) {
+                    for j in 0..num_res {
+                        work[j] += self.allocation[i][j];
+                    }
+                    finish[i] = true;
+                    found = true;
+                }
+            }
+            if !found {
+                break;
+            }
+        }
+        finish.into_iter().all(|f| f)
+    }
+
+    /// Try to acquire 1 unit of `res_id` for `tid`.
+    /// Returns `Ok(true)` if allocated immediately, `Ok(false)` if thread will block,
+    /// or `Err(())` if deadlock is detected.
+    pub fn try_acquire(
+        &mut self,
+        tid: usize,
+        res_id: usize,
+        num_tasks: usize,
+        detect_enabled: bool,
+    ) -> Result<bool, ()> {
+        self.ensure_size(num_tasks.max(tid + 1), res_id + 1);
+        self.need[tid][res_id] += 1;
+        if detect_enabled && !self.is_safe() {
+            self.need[tid][res_id] -= 1;
+            return Err(());
+        }
+        if self.available[res_id] > 0 {
+            self.need[tid][res_id] -= 1;
+            self.available[res_id] -= 1;
+            self.allocation[tid][res_id] += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Complete acquisition after waking up if it was not already handed off by `release`
+    pub fn post_acquire(&mut self, tid: usize, res_id: usize, allocated_before_lock: bool) {
+        if !allocated_before_lock && self.need[tid][res_id] > 0 {
+            self.need[tid][res_id] -= 1;
+            self.available[res_id] = self.available[res_id].saturating_sub(1);
+            self.allocation[tid][res_id] += 1;
+        }
+    }
+
+    /// Release 1 unit of `res_id` held by `tid`, optionally handing it off to `waking_tid`
+    pub fn release(
+        &mut self,
+        tid: usize,
+        res_id: usize,
+        waking_tid: Option<usize>,
+        num_tasks: usize,
+    ) {
+        let max_tid = waking_tid.unwrap_or(0).max(tid);
+        self.ensure_size(num_tasks.max(max_tid + 1), res_id + 1);
+        self.allocation[tid][res_id] = self.allocation[tid][res_id].saturating_sub(1);
+        if let Some(wtid) = waking_tid {
+            self.need[wtid][res_id] = self.need[wtid][res_id].saturating_sub(1);
+            self.allocation[wtid][res_id] += 1;
+        } else {
+            self.available[res_id] += 1;
+        }
+    }
+}
+
 /// Inner of Process Control Block
 pub struct ProcessControlBlockInner {
     /// is zombie?
@@ -49,6 +182,12 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// deadlock detection enabled?
+    pub deadlock_detect: bool,
+    /// mutex deadlock detector
+    pub mutex_detector: DeadlockDetector,
+    /// semaphore deadlock detector
+    pub sem_detector: DeadlockDetector,
 }
 
 impl ProcessControlBlockInner {
@@ -119,6 +258,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_detector: DeadlockDetector::new(),
+                    sem_detector: DeadlockDetector::new(),
                 })
             },
         });
@@ -245,6 +387,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_detector: DeadlockDetector::new(),
+                    sem_detector: DeadlockDetector::new(),
                 })
             },
         });
